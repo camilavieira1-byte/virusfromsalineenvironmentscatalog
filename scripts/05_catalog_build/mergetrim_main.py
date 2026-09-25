@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+Builds the MAIN (high-confidence) non-redundant viral catalog:
+  1. Filters geNomad-identified contigs to CheckV quality tiers
+     Complete / High-quality / Medium-quality (using the comparison
+     table from build_comparison_table.py, including its trim
+     recommendation for confirmed proviruses)
+  2. Filters phabox2-identified contigs (its own predicted_virus.fa set)
+     to the same three quality tiers, independently
+  3. For provirus contigs, keeps only the CheckV-trimmed viral portion
+     (from proviruses.fna) rather than the full host+virus sequence
+  4. Deduplicates EXACT-identical sequences across both sources, tagging
+     each retained sequence with which tool(s) independently called it
+     (this is why running two identification tools is worth the extra
+     compute — a meaningful fraction of the final catalog is typically
+     phabox-only or geNomad-only, not just a redundant overlap)
+
+Requires:
+  - comparison_genomad_pipeline_annotated.tsv (build_comparison_table.py)
+  - checkv_genomad_outputs/, checkv_phabox_outputs/ (04_checkv/*)
+
+Output: <BASE_DIR>/catalog_main_nonredundant.fasta / .tsv
+
+Usage: python mergetrim_main.py
+"""
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from catalog_utils import read_fasta  # noqa: E402
+
+BASE = Path(os.environ.get("BASE_DIR", "."))
+QUALITY_TIERS = ["Complete", "High-quality", "Medium-quality"]
+
+
+def main():
+    records = []
+
+    # --- genomad side: use the trim/keep decisions from the comparison table ---
+    comp = pd.read_csv(BASE / "comparison_genomad_pipeline_annotated.tsv", sep="\t")
+    comp = comp[comp["checkv_checkv_quality"].isin(QUALITY_TIERS)]
+
+    for sample, group in comp.groupby("sample"):
+        viruses = read_fasta(BASE / "checkv_genomad_outputs" / sample / "viruses.fna")
+        proviruses = read_fasta(BASE / "checkv_genomad_outputs" / sample / "proviruses.fna")
+        for _, row in group.iterrows():
+            cid = row["contig_id"]
+            if row.get("recommended_action") == "trim_at_checkv_boundary":
+                seq = next((s for k, s in proviruses.items() if k.startswith(cid)), None)
+            else:
+                seq = viruses.get(cid)
+            if seq:
+                records.append(("genomad", sample, cid, seq, row["checkv_checkv_quality"]))
+
+    # --- phabox side: same quality-tier rule, applied independently ---
+    for qs_path in (BASE / "checkv_phabox_outputs").glob("*/quality_summary.tsv"):
+        sample = qs_path.parts[-2]
+        qs = pd.read_csv(qs_path, sep="\t")
+        qs = qs[qs["checkv_quality"].isin(QUALITY_TIERS)]
+        viruses = read_fasta(BASE / "checkv_phabox_outputs" / sample / "viruses.fna")
+        proviruses = read_fasta(BASE / "checkv_phabox_outputs" / sample / "proviruses.fna")
+        for _, row in qs.iterrows():
+            cid = row["contig_id"]
+            if row["provirus"] == "Yes":
+                seq = next((s for k, s in proviruses.items() if k.startswith(cid)), None)
+            else:
+                seq = viruses.get(cid)
+            if seq:
+                records.append(("phabox", sample, cid, seq, row["checkv_quality"]))
+
+    df = pd.DataFrame(records, columns=["origin", "sample", "contig_id", "sequence", "checkv_quality"])
+    df["seq_hash"] = df["sequence"].apply(lambda s: hashlib.md5(s.encode()).hexdigest())
+
+    before = len(df)
+    origins_per_hash = df.groupby("seq_hash")["origin"].apply(lambda x: "+".join(sorted(set(x))))
+    df["called_by"] = df["seq_hash"].map(origins_per_hash)
+    df_dedup = df.drop_duplicates(subset="seq_hash", keep="first")
+    after = len(df_dedup)
+
+    print(f"{before} sequences before dedup, {after} after ({before - after} exact duplicates removed)")
+    print(df_dedup["called_by"].value_counts())
+
+    with open(BASE / "catalog_main_nonredundant.fasta", "w") as f:
+        for _, row in df_dedup.iterrows():
+            f.write(f">{row['sample']}|{row['contig_id']}|called_by={row['called_by']}\n{row['sequence']}\n")
+
+    df_dedup.drop(columns="sequence").to_csv(BASE / "catalog_main_nonredundant.tsv", sep="\t", index=False)
+
+
+if __name__ == "__main__":
+    main()
